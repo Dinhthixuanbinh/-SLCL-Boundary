@@ -311,7 +311,7 @@ class Trainer_MPSCL(Trainer_Advent):
             if not init_centroid_path.is_file():
                  # Try path relative to potential project root in /kaggle/working
                  # Ensure this path is correct for your Kaggle setup
-                 project_dir_in_working = Path("/kaggle/working/Soft-Labeled-Contrastive-Learning/")
+                 project_dir_in_working = Path("/kaggle/working/-SLCL-Boundary/")
                  init_centroid_path = project_dir_in_working / centroid_filename
 
             print(f"Attempting to load initial centroids from: {init_centroid_path.resolve()}")
