@@ -654,41 +654,84 @@ def update_class_center_iter(cla_src_feas, batch_src_labels, class_center_feas, 
     return class_center_feas
 
 
-def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th=.25):
+# --- JUQ-based pseudo-label generation start ---
+def prob_2_entropy(prob, smooth=1e-7):
+    """
+    Converts probabilistic prediction maps to entropy maps.
+    Args:
+        prob (torch.Tensor): Softmax probabilities (N, C, H, W).
+        smooth (float): Small value for numerical stability.
+    Returns:
+        torch.Tensor: Entropy map (N, 1, H, W) where higher values mean higher uncertainty.
+    """
+    entropy_map = -torch.mul(prob, torch.log2(prob + smooth)).sum(dim=1, keepdim=True)
+    return entropy_map # Shape (N, 1, H, W)
+
+def calculate_juq_reliability_map(raw_pseudo_labels_softmax: torch.Tensor, smooth=1e-7) -> torch.Tensor:
+    """
+    Calculates the Joint Uncertainty Quantification (JUQ) reliability map.
+    This function implements JUQ by combining normalized entropy-based uncertainty
+    and a proxy for distributional uncertainty (based on max probability/confidence).
+
+    Args:
+        raw_pseudo_labels_softmax (torch.Tensor): Raw softmax predictions for target domain (N, C, H, W).
+        smooth (float): Small value for numerical stability.
+    Returns:
+        torch.Tensor: Reliability map (N, 1, H, W) where higher values mean more reliable.
+                      Values are normalized to be between 0 and 1.
+    """
+    # Ensure input is softmax probabilities
+    if not torch.allclose(raw_pseudo_labels_softmax.sum(dim=1), torch.ones_like(raw_pseudo_labels_softmax[:, 0, :, :]), atol=1e-4):
+        raw_pseudo_labels_softmax = F.softmax(raw_pseudo_labels_softmax, dim=1)
+
+    # 1. Entropy-based Uncertainty (U_entropy)
+    U_entropy_raw = prob_2_entropy(raw_pseudo_labels_softmax, smooth=smooth) # (N, 1, H, W)
+    sum_U_entropy_raw_per_batch = U_entropy_raw.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
+    U_entropy_norm = 1 - (U_entropy_raw / (sum_U_entropy_raw_per_batch + smooth))
+    U_entropy_norm = torch.clamp(U_entropy_norm, 0, 1)
+
+    # 2. Distributional Uncertainty (U_Dis-norm)
+    max_prob, _ = torch.max(raw_pseudo_labels_softmax, dim=1, keepdim=True) # (N, 1, H, W)
+    U_Dis_raw_proxy = 1 - max_prob
+    sum_U_Dis_raw_proxy_per_batch = U_Dis_raw_proxy.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
+    U_Dis_norm = torch.exp(-(U_Dis_raw_proxy / (sum_U_Dis_raw_proxy_per_batch + smooth)))
+    U_Dis_norm = torch.clamp(U_Dis_norm, 0, 1)
+
+    # 3. Joint Uncertainty Quantification (JUQ)
+    juq_map = U_Dis_norm * U_entropy_norm
+    min_juq = juq_map.min(dim=3, keepdim=True).values.min(dim=2, keepdim=True).values # (N, 1, 1, 1)
+    max_juq = juq_map.max(dim=3, keepdim=True).values.max(dim=2, keepdim=True).values # (N, 1, 1, 1)
+    juq_map_normalized = (juq_map - min_juq) / (max_juq - min_juq + smooth)
+    return juq_map_normalized # Shape (N, 1, H, W)
+
+
+def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_softmax):
     '''
-    class_centers: C*N_fea
-    cla_feas_trg: N*N_fea*H*W
+    Generates pseudo-labels for target domain using JUQ for reliability assessment.
+    Args:
+        cla_feas_trg (torch.Tensor): Decoder features for target images (N, C_feat, H, W).
+        class_centers (torch.Tensor): Class prototypes (N_class, C_feat).
+        pixel_sel_th (float): Original pixel selection threshold (not used in JUQ logic, kept for compatibility).
+        pred_t_softmax (torch.Tensor): Softmax predictions for target images (N, C_class, H, W).
+    Returns:
+        tuple: (hard_pixel_label, reliability_map)
+            hard_pixel_label (torch.Tensor): Argmax pseudo-labels (N, H, W).
+            reliability_map (torch.Tensor): JUQ-derived reliability map (N, 1, H, W).
     '''
-
-    def pixel_selection(batch_pixel_cosine, th):
-        one_tag = torch.ones([1]).float().cuda()
-        zero_tag = torch.zeros([1]).float().cuda()
-
-        batch_sort_cosine, _ = torch.sort(batch_pixel_cosine, dim=1)
-        pixel_sub_cosine = batch_sort_cosine[:, -1] - batch_sort_cosine[:, -2]
-        pixel_mask = torch.where(pixel_sub_cosine > th, one_tag, zero_tag)
-
-        return pixel_mask
-
+    # Normalize features and class centers for cosine similarity (not used for mask, but for compatibility)
     cla_feas_trg_de = cla_feas_trg.detach()
     batch, N_fea, H, W = cla_feas_trg_de.size()
     cla_feas_trg_de = F.normalize(cla_feas_trg_de, p=2, dim=1)
     class_centers_norm = F.normalize(class_centers, p=2, dim=1)
-    cla_feas_trg_de = cla_feas_trg_de.transpose(1, 2).contiguous().transpose(2, 3).contiguous()  # N*H*W*N_fea
-    cla_feas_trg_de = torch.reshape(cla_feas_trg_de, [-1, N_fea])
-    class_centers_norm = class_centers_norm.transpose(0, 1)  # N_fea*C
-    batch_pixel_cosine = torch.matmul(cla_feas_trg_de, class_centers_norm)  # N*N_class
-    pixel_mask = pixel_selection(batch_pixel_cosine, pixel_sel_th)
-    hard_pixel_label = torch.argmax(batch_pixel_cosine, dim=1)
-
-    return hard_pixel_label, pixel_mask
-
-
-def prob_2_entropy(prob):
-    """ convert probabilistic prediction maps to weighted self-information maps
-    """
-    n, c, h, w = prob.size()
-    return -torch.mul(prob, torch.log2(prob + 1e-7)) / np.log2(c)
+    # Reshape features for matrix multiplication with class centers (not used for mask)
+    cla_feas_trg_de_reshaped = cla_feas_trg_de.permute(0, 2, 3, 1).contiguous().view(-1, N_fea) # (N*H*W, N_fea)
+    class_centers_norm_transposed = class_centers_norm.transpose(0, 1) # (N_fea, N_class)
+    # Calculate JUQ reliability map
+    reliability_map = calculate_juq_reliability_map(pred_t_softmax) # (N, 1, H, W)
+    # Determine hard pseudo-labels (argmax of softmax predictions)
+    hard_pixel_label = torch.argmax(pred_t_softmax, dim=1) # (N, H, W)
+    return hard_pixel_label, reliability_map
+# --- JUQ-based pseudo-label generation end ---
 
 
 def generate_dataframe(centroid_list, columns, extra_columns, i_iter, domain: str):

@@ -113,46 +113,60 @@ class Trainer_MPSCL(Trainer_Advent):
             img_s, labels_s, names = batch_content
             img_s, labels_s = img_s.to(self.device, non_blocking=self.args.pin_memory), \
                               labels_s.to(self.device, non_blocking=self.args.pin_memory)
-            img_t, labels_t, namet = batch_style
-            img_t = img_t.to(self.device, non_blocking=self.args.pin_memory)
-
+            
+            # Student forward pass for source
             out_s = self.segmentor(img_s, features_out=True)
             pred_s_main, pred_s_aux, dcdr_ft_s = out_s
-            out_t = self.segmentor(img_t, features_out=True)
-            pred_t_main, pred_t_aux, dcdr_ft_t = out_t
-
+            
             loss_seg = loss_calc(pred_s_main, labels_s, self.device, False) + dice_loss(pred_s_main, labels_s)
             loss_seg_list.append(loss_seg.item())
-
             # Aux loss disabled
             total_loss_s = loss_seg
             loss_seg_aux = torch.tensor(0.0, device=self.device)
             loss_seg_aux_list.append(loss_seg_aux.item())
 
-            self.centroid_s = update_class_center_iter(dcdr_ft_s, labels_s, self.centroid_s,
-                                                       m=self.args.class_center_m)
-            hard_pixel_label, pixel_mask = generate_pseudo_label(dcdr_ft_t, self.centroid_s, self.args.pixel_sel_th)
+            self.centroid_s = update_class_center_iter(dcdr_ft_s, labels_s, self.centroid_s, m=self.args.class_center_m)
 
-            # MPCL Source Loss (partition removed)
-            mpcl_loss_tr = mpcl_loss_calc(feas=dcdr_ft_s, labels=labels_s,
-                                          class_center_feas=self.centroid_s.detach(),
-                                          loss_func=self.mpcl_loss_src, tag='source')
+            img_t, labels_t, namet = batch_style
+            img_t = img_t.to(self.device, non_blocking=self.args.pin_memory)
+            
+            # Student forward pass for target
+            out_t = self.segmentor(img_t, features_out=True)
+            pred_t_main, pred_t_aux, dcdr_ft_t = out_t
+            
+            # --- MODIFICATION START ---
+            # Apply softmax to the main prediction for JUQ
+            pred_t_softmax = F.softmax(pred_t_main, dim=1)
+
+            # Generate pseudo-labels and reliability map using JUQ
+            # The original `pixel_mask` will now be the `reliability_map` from JUQ
+            hard_pixel_label, reliability_map = generate_pseudo_label(
+                dcdr_ft_t, self.centroid_s, self.args.pixel_sel_th, pred_t_softmax
+            )
+            # --- MODIFICATION END ---
+
+            # MPCL Source Loss
+            mpcl_loss_tr = mpcl_loss_calc(feas=dcdr_ft_s, labels=labels_s, class_center_feas=self.centroid_s.detach(), loss_func=self.mpcl_loss_src, tag='source')
             loss_mpcl_tr_list.append(mpcl_loss_tr.item())
 
-            # MPCL Target Loss (partition removed)
-            mpcl_loss_tg = mpcl_loss_calc(feas=dcdr_ft_t, labels=hard_pixel_label,
-                                          class_center_feas=self.centroid_s.detach(),
-                                          loss_func=self.mpcl_loss_trg,
-                                          pixel_sel_loc=pixel_mask, tag='target')
+            # MPCL Target Loss
+            # Pass the reliability_map (flattened) as pixel_sel_loc
+            mpcl_loss_tg = mpcl_loss_calc(
+                feas=dcdr_ft_t,
+                labels=hard_pixel_label, # Use the hard_pixel_label (argmax)
+                class_center_feas=self.centroid_s.detach(),
+                loss_func=self.mpcl_loss_trg,
+                pixel_sel_loc=reliability_map.view(-1), # Pass the flattened reliability map
+                tag='target'
+            )
             loss_mpcl_tg_list.append(mpcl_loss_tg.item())
 
             # CNR Loss (Placeholder logic)
             loss_cnr = torch.tensor(0.0, device=self.device)
             if cnr_weight > 0:
                 try:
-                    from utils.utils_ import cal_centroid
-                    centroid_t = cal_centroid(features=dcdr_ft_t, pseudo_label=hard_pixel_label,
-                                              num_cls=self.args.num_classes, pixel_mask=pixel_mask)
+                    from utils.utils_ import cal_centroid # Ensure this is imported
+                    centroid_t, _, _ = cal_centroid(features=dcdr_ft_t, pseudo_label=hard_pixel_label, num_cls=self.args.num_classes, pixel_mask=reliability_map)
                     centroid_s_norm = torch.norm(self.centroid_s.detach(), p=2, dim=1)
                     centroid_t_norm = torch.norm(centroid_t, p=2, dim=1)
                     loss_cnr = self.mse_loss(centroid_s_norm, centroid_t_norm)
@@ -167,14 +181,14 @@ class Trainer_MPSCL(Trainer_Advent):
                 loss_cnr_list.append(loss_cnr.item())
 
             # Adversarial Loss
-            pred_t_softmax = F.softmax(pred_t_main, dim=1)
-            uncertainty_mapT = prob_2_entropy(pred_t_softmax)
+            # The uncertainty_mapT here is the entropy map, which is part of JUQ.
+            # This part of the code already uses entropy for adversarial training.
+            uncertainty_mapT = prob_2_entropy(pred_t_softmax) # This is already calculated from pred_t_softmax
             D_out_main = self.d_main(uncertainty_mapT)
             loss_adv_main = F.binary_cross_entropy_with_logits(D_out_main, torch.FloatTensor(
                 D_out_main.data.size()).fill_(source_domain_label).to(self.device))
             loss_adv_list.append(loss_adv_main.item())
             loss_adv = self.args.w_dis * loss_adv_main
-
             loss_adv_aux = torch.tensor(0.0, device=self.device)
             if self.args.multilvl:
                 try:
@@ -185,16 +199,11 @@ class Trainer_MPSCL(Trainer_Advent):
                         D_out_aux.data.size()).fill_(source_domain_label).to(self.device))
                     loss_adv += self.args.w_dis_aux * loss_adv_aux
                 except Exception as e:
-                     print(f"Warning: Error calculating aux adv loss: {e}. Skipping.")
-                     loss_adv_aux = torch.tensor(0.0, device=self.device)
-            loss_adv_aux_list.append(loss_adv_aux.item())
+                    print(f"Warning: Error calculating aux adv loss: {e}. Skipping.")
+                loss_adv_aux_list.append(loss_adv_aux.item())
 
             # Total Generator Loss
-            total_generator_loss = (total_loss_s
-                                   + loss_adv
-                                   + self.args.w_mpcl_s * mpcl_loss_tr
-                                   + self.args.w_mpcl_t * mpcl_loss_tg
-                                   + cnr_weight * loss_cnr)
+            total_generator_loss = (total_loss_s + loss_adv + self.args.w_mpcl_s * mpcl_loss_tr + self.args.w_mpcl_t * mpcl_loss_tg + cnr_weight * loss_cnr)
             total_generator_loss.backward()
 
             # Train Discriminators
