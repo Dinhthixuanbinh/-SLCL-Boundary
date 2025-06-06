@@ -49,14 +49,14 @@ class Trainer_AdapSeg(Trainer_baseline):
         from model.GAN import UncertaintyDiscriminator
         super(Trainer_AdapSeg, self).prepare_model()
 
-        self.d_main = UncertaintyDiscriminator(in_channel=self.args.num_classes)
+        self.d_main = UncertaintyDiscriminator(in_channel=1)
         if self.args.restore_d:
             checkpoint = torch.load(self.args.restore_d)
             self.d_main.load_state_dict(checkpoint['model_state_dict'])
             print("Discriminator load from state dict: {}".format(os.path.basename(self.args.restore_d)))
         self.d_main.train()
         self.d_main.to(self.device)
-        self.d_aux = UncertaintyDiscriminator(in_channel=self.args.num_classes)
+        self.d_aux = UncertaintyDiscriminator(in_channel=1)
         if self.args.restore_d_aux:
             checkpoint = torch.load(self.args.restore_d_aux)
             self.d_aux.load_state_dict(checkpoint['model_state_dict'])
