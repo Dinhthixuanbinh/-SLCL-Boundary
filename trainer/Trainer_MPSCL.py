@@ -192,6 +192,9 @@ class Trainer_MPSCL(Trainer_Advent):
             reliable_indices = torch.nonzero(reliable_pixel_mask, as_tuple=True)
             
             num_reliable_pixels = reliable_indices[0].shape[0]
+            target_sub_centroid_1 = torch.zeros(self.args.num_classes, student_dcdr_ft_t.shape[1], device=self.device)
+            target_sub_centroid_2 = torch.zeros(self.args.num_classes, student_dcdr_ft_t.shape[1], device=self.device)
+            
             if num_reliable_pixels > 0:
                 permuted_indices = torch.randperm(num_reliable_pixels, device=self.device)
                 split_point = num_reliable_pixels // 2
