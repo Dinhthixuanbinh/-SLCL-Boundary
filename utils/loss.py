@@ -21,7 +21,7 @@ def jaccard_loss(true, logits, eps=1e-7):
     num_classes = logits.shape[1]
     true = true.to(logits.device)
     if num_classes == 1:
-        true_1_hot = torch.eye(num_classes + 1).to(true.device)[true.squeeze(1)]
+        true_1_hot = torch.eye(num_classes + 1, device=true.device)[true.squeeze(1)]
         true_1_hot = torch.moveaxis(true_1_hot, -1, 1)
         true_1_hot_f = true_1_hot[:, 0:1, :, :]  # background
         true_1_hot_s = true_1_hot[:, 1:2, :, :]  # foreground
@@ -31,7 +31,7 @@ def jaccard_loss(true, logits, eps=1e-7):
         probas = torch.cat([pos_prob, neg_prob], dim=1)
         
     else:
-        true_1_hot = torch.eye(num_classes).to(true.device)[true.squeeze(1)]
+        true_1_hot = torch.eye(num_classes, device=true.device)[true.squeeze(1)]
         true_1_hot = torch.moveaxis(true_1_hot, -1, 1)  # B, C, H, W
         probas = F.softmax(logits, dim=1)
     true_1_hot = true_1_hot.type(logits.type())
@@ -71,9 +71,9 @@ def dice_loss(pred, target):
     target: [N,H,W]
     """
     n, c, h, w = pred.size()
-    pred = pred.cuda()
-    target = target.cuda()
-    target_onehot = torch.zeros([n, c, h, w]).cuda()
+    pred = pred.to(pred.device)
+    target = target.to(pred.device)
+    target_onehot = torch.zeros([n, c, h, w], device=pred.device)
     target = torch.unsqueeze(target, dim=1)  # n*1*h*w
     target_onehot.scatter_(1, target.long(), 1)
 
@@ -140,79 +140,58 @@ def cosine_similarity_BCL(class_list, label_resize, feature, label2, feature2, n
     @param num_class: the total number of classes
     @return:
     """
-    # get the shape of the feature
     _, ch, feature_h, feature_w = feature.size()
-    prototypes = torch.zeros(size=(num_class, ch)).cuda()
+    prototypes = torch.zeros(size=(num_class, ch), device=feature.device)
     for i, index in enumerate(class_list):
-        # enumerate over the class index in the class_list, class 255 is ignored
         if index != 255.:
-            fg_mask = ((label_resize == index) * 1).cuda().detach()  # extract the mask for label == index
-            # mask out the features correspond to certain class index and calculate the masked average feature
-            prototype = (fg_mask * feature).squeeze().resize(ch, feature_h * feature_w).sum(
-                -1) / fg_mask.sum()
-            prototypes[int(index)] = prototype  # (class_num, ch) register the prototypes into the list
+            fg_mask = ((label_resize == int(index)) * 1).to(feature.device).detach()
+            if fg_mask.sum() > 0:
+                prototype = (fg_mask * feature).squeeze().reshape(ch, feature_h * feature_w).sum(-1) / fg_mask.sum()
+            else:
+                prototype = torch.zeros(ch, device=feature.device)
+            prototypes[int(index)] = prototype
 
-    # (class_num, feature_h * feature_w) the cosine similarity between each class in one domain and each
-    # individual feature in another domain
     cs_map = torch.matmul(F.normalize(prototypes, dim=1),
-                          F.normalize(feature2.squeeze().resize(ch, feature_h * feature_w), dim=0))
-    # set the value to -1 (smallest in cosine value) when the class index does not overlap in both two domain
+                          F.normalize(feature2.squeeze().reshape(ch, feature_h * feature_w), dim=0))
     cs_map[cs_map == 0] = -1
-    # make sure that label and label2 have the same shape
-    cosine_similarity_map = F.interpolate(cs_map.resize(1, num_class, feature_h, feature_w), size=label2.size()[-2:])
+    cosine_similarity_map = F.interpolate(cs_map.reshape(1, num_class, feature_h, feature_w), size=label2.size()[-2:])
     cosine_similarity_map *= 10
     return cosine_similarity_map
 
 
 def bidirect_contrastive_loss_BCL(feature_s, label_s, feature_t, label_t, num_class, config):
-    """
-    Calculate the contrastive loss between two features of different domains
-    @param feature_s:  1, C, h, w the source feature
-    @param label_s: 1, H, W the source (pseudo)label
-    @param feature_t: 1, C, h, w the target feature
-    @param label_t: 1, H, W the target (pseudo)label
-    @param num_class: the total number of classes
-    @param config: the configuration variable
-    @return:
-    """
-
-    # interpolate(down-sample) the labels to have the same size as the features
     _, ch, feature_s_h, feature_s_w = feature_s.size()
-    label_s_resize = F.interpolate(label_s.float().unsqueeze(0), size=(feature_s_h, feature_s_w))  # (1, 1, h, w)
+    label_s_resize = F.interpolate(label_s.float().unsqueeze(0), size=(feature_s_h, feature_s_w), mode='nearest')
     _, _, feature_t_h, feature_t_w = feature_t.size()
-    label_t_resize = F.interpolate(label_t.float().unsqueeze(0), size=(feature_t_h, feature_t_w))  # (1, 1, h, w)
+    label_t_resize = F.interpolate(label_t.float().unsqueeze(0), size=(feature_t_h, feature_t_w), mode='nearest')
 
-    # get the unique class number for both source and target (pseudo)labels
     source_list = torch.unique(label_s_resize.float())
     target_list = torch.unique(label_t_resize.float())
 
-    # find the overlapping class index except 255
     overlap_classes = [int(index.detach()) for index in source_list if index in target_list and index != 255]
-    # calculate the similarity map
     cosine_similarity_map = cosine_similarity_BCL(source_list, label_s_resize, feature_s, label_t, feature_t, num_class)
 
-    cross_entropy_weight = torch.zeros(size=(num_class, 1))
+    cross_entropy_weight = torch.zeros(size=(num_class, 1), device=feature_s.device)
     cross_entropy_weight[overlap_classes] = 1
-    cross_entropy_weight = cross_entropy_weight.cuda()
-    # generate the cross entropy loss where only the overlapping classes are taken into count
-    prototype_loss = torch.nn.CrossEntropyLoss(weight=cross_entropy_weight, ignore_index=255)
+    prototype_loss = torch.nn.CrossEntropyLoss(weight=cross_entropy_weight.squeeze(), ignore_index=255)
 
-    # generate the prediction map containing class indices where uncertainty pixels are set to 255
-    prediction_by_cs = F.softmax(cosine_similarity_map, dim=1)  # compute the softmax of the similarity map
-    target_predicted = prediction_by_cs.argmax(dim=1)  #
-    confidence_of_target_predicted = prediction_by_cs.max(dim=1).values  # the max value for each category
+    prediction_by_cs = F.softmax(cosine_similarity_map, dim=1)
+    target_predicted = prediction_by_cs.argmax(dim=1)
+    confidence_of_target_predicted = prediction_by_cs.max(dim=1).values
     masked_target_predicted = torch.where(confidence_of_target_predicted > .8, target_predicted, 255)
     masked_target_predicted_resize = F.interpolate(masked_target_predicted.float().unsqueeze(0),
-                                                   size=(feature_t_h, feature_t_w), mode='nearest')
-    # set the pixels to 255 if the pixel in the (pseudo)label is 255 (uncertainty)
-    label_t_resize_new = label_t_resize.clone().contiguous()
+                                                   size=(feature_t_h, feature_t_w), mode='nearest').long()
+    label_t_resize_new = label_t_resize.clone().contiguous().long()
     label_t_resize_new[label_t_resize_new == 255] = masked_target_predicted_resize[label_t_resize_new == 255]
-    target_list2 = torch.unique(label_t_resize_new)
+    if label_t_resize_new.numel() > 0:
+        target_list2 = torch.unique(label_t_resize_new.float())
+    else:
+        target_list2 = torch.tensor([], device=feature_s.device)
 
     cosine_similarity_map2 = cosine_similarity_BCL(target_list, label_t_resize, feature_t, feature_s, label_s)
 
-    metric_loss1 = prototype_loss(cosine_similarity_map, label_t)
-    metric_loss2 = prototype_loss(cosine_similarity_map2, label_s)
+    metric_loss1 = prototype_loss(cosine_similarity_map, label_t.long())
+    metric_loss2 = prototype_loss(cosine_similarity_map2, label_s.long())
 
     metric_loss = config.lamb_metric1 * metric_loss1 + config.lamb_metric2 * metric_loss2
     return metric_loss
@@ -233,65 +212,39 @@ class ContrastiveLoss(nn.Module):
     def __init__(self, tau=5, n_class=4, bg=False, norm=True):
         super(ContrastiveLoss, self).__init__()
         self._tau = tau
-        # self._n_class = n_class
-        # self._bg = bg
         self._norm = norm
+        self._n_class = n_class
+        self._bg = bg
 
-    def forward(self, centroid_s, centroid_t, bg=False, split=False):  # centroid_s (4, 32)
-        norm_t = torch.norm(centroid_t, p=2, dim=1, keepdim=True)  # (4, 1)
+    def forward(self, centroid_s, centroid_t, bg=False, split=False):
+        centroid_s = centroid_s.to(centroid_t.device)
         if self._norm:
-            norm_s = torch.norm(centroid_s, p=2, dim=1, keepdim=True)  # (4, 1) compute the L2 norm of each centroid
-            centroid_s = centroid_s / (norm_s + 1e-7)
-            centroid_t = centroid_t / (norm_t + 1e-7)
-        # a matrix with shape (#class, 2 * #class) storing the exponential values between two centroids
-        # centroid_matrix = torch.zeros(n_class, 2 * n_class)
-        # n_class = centroid_s.size()[0]
-        # loss = 0
-        # for i in range(0 if bg else 1, n_class):
-        #     exp_sum = 0
-        #     exp_self = 0
-        #     for j in range(n_class):
-        #         if i == j:
-        #             exp_self = exp_func(centroid_t[i], centroid_s[j], tau=self._tau) + \
-        #                        exp_func(centroid_t[i], centroid_t[j], tau=self._tau)
-        #             exp_sum = exp_sum + exp_self
-        #         else:
-        #             exp_sum = exp_sum + exp_func(centroid_t[i], centroid_s[j], tau=self._tau) + \
-        #                       exp_func(centroid_t[i], centroid_t[j], tau=self._tau)
-        #     logit = -torch.log(exp_self / (exp_sum + 1e-7))
-        #     loss = loss + logit
-        exp_mm = torch.exp(torch.mm(centroid_t, centroid_s.transpose(0, 1)))
-        exp_mm_t = torch.exp(torch.mm(centroid_t, centroid_t.transpose(0, 1)))
-        diag_idx = torch.arange(0 if bg else 1, 4, dtype=torch.long)
-        denom = exp_mm[0 if bg else 1:].sum(dim=1) + exp_mm_t[0 if bg else 1:].sum(dim=1)
-        if split:
-            nom1, nom2 = exp_mm[diag_idx, diag_idx], exp_mm_t[diag_idx, diag_idx]
-            logit = 0.5 * (-torch.log(nom1 / (denom + 1e-7)) - torch.log(nom2 / (denom + 1e-7)))
-        else:
-            nom = exp_mm[diag_idx, diag_idx] + exp_mm_t[diag_idx, diag_idx]
-            logit = -torch.log(nom / (denom + 1e-7))
-        loss = logit.sum()
+            centroid_s = F.normalize(centroid_s, p=2, dim=1)
+            centroid_t = F.normalize(centroid_t, p=2, dim=1)
+        exp_mm_st = torch.exp(torch.mm(centroid_t, centroid_s.transpose(0, 1)) / self._tau)
+        exp_mm_tt = torch.exp(torch.mm(centroid_t, centroid_t.transpose(0, 1)) / self._tau)
+        start_idx = 0 if self._bg else 1
+        diag_elements_st = torch.diag(exp_mm_st[start_idx:])
+        diag_elements_tt = torch.diag(exp_mm_tt[start_idx:])
+        numerator = diag_elements_st + diag_elements_tt
+        denominator_st = exp_mm_st[start_idx:].sum(dim=1)
+        denominator_tt = exp_mm_tt[start_idx:].sum(dim=1)
+        denominator = denominator_st + denominator_tt
+        denominator = denominator.clamp(min=1e-7)
+        loss_per_class = -torch.log(numerator / denominator)
+        loss = loss_per_class.sum()
         return loss
 
 
 def contrastive_loss(centroid_s, centroid_t, tau=5, n_class=4, bg_included=False, norm=False):
     """
-
-    :param centroid_s: (4, 32)
-    :param centroid_t:
-    :param tau: temperature parameter
-    :param n_class: the number of classes in the label
-    :param bg_included: if the background is included in the computation of contrastive loss
-    :param norm: whether divide norms in the contrastive loss
-    :return:
+    Deprecated: Replaced by class ContrastiveLoss for cleaner implementation.
     """
     if norm:
-        norm_s = torch.norm(centroid_s, p=2, dim=1, keepdim=True)  # (4, 1) compute the L2 norm of each centroid
-        norm_t = torch.norm(centroid_t, p=2, dim=1, keepdim=True)  # (4, 1)
+        norm_s = torch.norm(centroid_s, p=2, dim=1, keepdim=True)
+        norm_t = torch.norm(centroid_t, p=2, dim=1, keepdim=True)
         centroid_s = centroid_s / norm_s
         centroid_t = centroid_t / norm_t
-    # a matrix with shape (#class, 2 * #class) storing the exponential values between two centroids
-    # centroid_matrix = torch.zeros(n_class, 2 * n_class)
     loss = 0
     for i in range(0 if bg_included else 1, n_class):
         exp_sum = 0
@@ -303,8 +256,10 @@ def contrastive_loss(centroid_s, centroid_t, tau=5, n_class=4, bg_included=False
             if i == j:
                 exp_self = exp_func(centroid_t[i], centroid_s[j], tau=tau)
             exp_sum = exp_sum + exp_func(centroid_t[i], centroid_s[j], tau=tau)
+        if exp_sum.item() == 0:
+            continue
         logit = torch.unsqueeze(torch.unsqueeze(torch.log(torch.div(exp_self, exp_sum)), 0), 0)
-        loss_class = nn.NLLLoss()(logit, torch.tensor([0], requires_grad=False).cuda())
+        loss_class = nn.NLLLoss()(logit, torch.tensor([0], requires_grad=False).to(centroid_s.device))
         if math.isnan(loss_class.item()):
             print('nan!!!')
         loss = loss + loss_class
@@ -324,63 +279,41 @@ class SupConLoss(nn.Module):
         self.base_temperature = base_temperature
 
     def forward(self, features, labels=None):
-        # input features shape: [bsz, v, c, w, h]
-        # input labels shape: [bsz, v, w, h]
-        device = (torch.device('cuda')
-                  if features.is_cuda
-                  else torch.device('cpu'))
-
+        device = features.device
         if features.ndim <= 3:
             raise ValueError('`features` needs to be [bsz, n_views, ...],'
                              'at least 4 dimensions are required')
         if features.ndim == 5:
             contrast_count = features.shape[1]
             contrast_feature = torch.cat(torch.unbind(features, dim=1),
-                                         dim=0)  # of size (bsz*v, c, h, w) (2, 32, 56, 56)
-
-        kernels = contrast_feature.permute(0, 2, 3, 1)  # (2, 56, 56, 32)
-        kernels = kernels.reshape(-1, contrast_feature.shape[1], 1, 1)  # (6272, 32, 1, 1)
-        # kernels = kernels[non_background_idx]
+                                         dim=0)
+        kernels = contrast_feature.permute(0, 2, 3, 1)
+        kernels = kernels.reshape(-1, contrast_feature.shape[1], 1, 1)
         logits = torch.div(F.conv2d(contrast_feature, kernels),
-                           self.temperature)  # of size (bsz*v, bsz*v*h*w, h, w) (2, 6272, 56, 56)
-        logits = logits.permute(1, 0, 2, 3)  # (6272, 2, 56, 56)
-        logits = logits.reshape(logits.shape[0],
-                                -1)  # (6272, 6272) the vector multiplication of the combination of every two vector features
-
+                           self.temperature)
+        logits = logits.permute(1, 0, 2, 3)
+        logits = logits.reshape(logits.shape[0], -1)
         if labels is not None:
             labels = torch.cat(torch.unbind(labels, dim=1), dim=0)
             labels = labels.contiguous().view(-1, 1)
             mask = torch.eq(labels, labels.T).float().to(device)
-
             bg_bool = torch.eq(labels.squeeze().cpu(), torch.zeros(labels.squeeze().shape))
             non_bg_bool = ~ bg_bool
             non_bg_bool = non_bg_bool.int().to(device)
         else:
-            mask = torch.eye(logits.shape[0] // contrast_count).float().to(device)  # (3136, 3136)
-            mask = mask.repeat(contrast_count, contrast_count)  # (6272, 6272)
-            # print(mask.shape)
-
-        # mask-out self-contrast cases
+            mask = torch.eye(logits.shape[0] // contrast_count).float().to(device)
+            mask = mask.repeat(contrast_count, contrast_count)
         logits_mask = torch.scatter(
             torch.ones_like(mask), 1, torch.arange(mask.shape[0]).view(-1, 1).to(device), 0
-        )  # (6272, 6272) replace the diagonal of the ones matrix with 0.
-        mask = mask * logits_mask  # mask[:3136, 3136: 6272] and mask[3136: 6272, : 3136] are diagonal matrices. Other part of mask is 0.
-
-        # compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask  # Reduce diagonal to 0 and keep other elements unchanged
+        )
+        mask = mask * logits_mask
+        exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(
-            exp_logits.sum(1, keepdim=True))  # (6272, 6272) log(exp(v1*v2)) - log(sum(exp(vi*vj))) = Contrasitve loss
-
-        # compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(
-            1)  # (6272,) only include the elements that represent the positive pair with the row sample
-
-        # loss
+            exp_logits.sum(1, keepdim=True))
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - mean_log_prob_pos
-        # loss = loss.view(anchor_count, batch_size).mean()
         if labels is not None:
-            # only consider the contrastive loss for non-background pixel
-            loss = (loss * non_bg_bool).sum() / (non_bg_bool.sum())
+            loss = (loss * non_bg_bool).sum() / (non_bg_bool.sum() + 1e-7)
         else:
             loss = loss.mean()
         return loss
@@ -395,16 +328,12 @@ class LocalConLoss(nn.Module):
         self.stride = stride
 
     def forward(self, features, labels=None):
-        # input features: [bsz, num_view, c, h ,w], h & w are the image size
-        # resample feature maps to reduce memory consumption and running time
         features = features[:, :, :, ::self.stride, ::self.stride]
-
         if labels is not None:
             labels = labels[:, :, ::self.stride, ::self.stride]
             if labels.sum() == 0:
                 loss = torch.tensor(0).float().to(self.device)
                 return loss
-
             loss = self.supconloss(features, labels)
             return loss
         else:
@@ -420,48 +349,35 @@ class BlockConLoss(nn.Module):
         self.supconloss = SupConLoss(temperature=temperature)
 
     def forward(self, features, labels=None):
-        # input features: [bsz, num_view, c, h ,w], h & w are the image size
-        shape = features.shape  # (1, 2, 32, 224, 224)
+        shape = features.shape
         img_size = shape[-1]
-        div_num = img_size // self.block_size  # 14
+        div_num = img_size // self.block_size
         if labels is not None:
             loss = []
             for i in range(div_num):
-                # print("Iteration index:", idx, "Batch_size:", b)
                 for j in range(div_num):
-                    # print("before ith iteration, the consumption memory is:", torch.cuda.memory_allocated() / 1024**2)
                     block_features = features[:, :, :, i * self.block_size:(i + 1) * self.block_size,
-                                     j * self.block_size:(j + 1) * self.block_size]
+                                              j * self.block_size:(j + 1) * self.block_size]
                     block_labels = labels[:, :, i * self.block_size:(i + 1) * self.block_size,
                                    j * self.block_size:(j + 1) * self.block_size]
-
                     if block_labels.sum() == 0:
                         continue
-
                     tmp_loss = self.supconloss(block_features, block_labels)
                     loss.append(tmp_loss)
-
             if len(loss) == 0:
                 loss = torch.tensor(0).float().to(self.device)
                 return loss
             loss = torch.stack(loss).mean()
             return loss
-
         else:
             loss = []
             for i in range(div_num):
-                # print("Iteration index:", idx, "Batch_size:", b)
                 for j in range(div_num):
-                    # print("before ith iteration, the consumption memory is:", torch.cuda.memory_allocated() / 1024**2)
                     block_features = features[:, :, :, i * self.block_size:(i + 1) * self.block_size,
-                                     j * self.block_size:(
-                                                                     j + 1) * self.block_size]  # (1, 2, 32, block_size, block_size)
-
+                                              j * self.block_size:(j + 1) * self.block_size]
                     tmp_loss = self.supconloss(block_features)
-
                     loss.append(tmp_loss)
-
-            loss = torch.stack(loss).mean()  # torch.stack(loss).size() = 196
+            loss = torch.stack(loss).mean()
             return loss
 
 
@@ -475,160 +391,109 @@ class MPCL(nn.Module):
         self.m = m
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)  # -0.8775825618903726
-        self.mm = math.sin(math.pi - m) * m  # 0.23971276930210156
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
         self.device = device
         self.easy_margin = easy_margin
 
     def forward(self, features, labels, class_center_feas,
                 pixel_sel_loc=None, mask=None):
-        """
-        :param features: [B * H * W] * 1 * C  normalized.
-        :param labels: B * H * W.
-        :param class_center_feas: class prototypes C * #class.
-        :param pixel_sel_loc: mask to select features for the loss, [B * H * W].
-        :param mask: mask that indicate which class the pixel belongs to.
-        :return: the pixel-wise contrastive loss
-        """
         if len(features.shape) < 3:
             raise ValueError('`features` needs to be [bsz, n_views, ...],'
                              'at least 3 dimensions are required')
         if len(features.shape) > 3:
             features = features.view(features.shape[0], features.shape[1], -1)
-
-        """build mask"""
         num_samples = features.shape[0]
         if labels is not None and mask is not None:
             raise ValueError('Cannot define both `labels` and `mask`')
         elif labels is None and mask is None:
-            mask = torch.eye(num_samples, dtype=torch.float32).cuda()
+            mask = torch.eye(num_samples, dtype=torch.float32, device=self.device)
         elif labels is not None:
-            labels = labels.contiguous().view(-1, 1).long()  # n_sample*1
-            class_center_labels = torch.arange(0, self.num_class).long().cuda()
-            # print(class_center_labels)
-            class_center_labels = class_center_labels.contiguous().view(-1, 1)  # n_class*1
+            labels = labels.contiguous().view(-1, 1).long().to(self.device)
+            class_center_labels = torch.arange(0, self.num_class).long().to(self.device)
+            class_center_labels = class_center_labels.contiguous().view(-1, 1)
             if labels.shape[0] != num_samples:
                 raise ValueError('Num of labels does not match num of features')
-            """convert to one-hot encoded mask [B * H * W] * #class indicating the positive class of each pixel"""
-            mask = torch.eq(labels,
-                            torch.transpose(class_center_labels, 0, 1)).float().cuda()  # broadcast n_sample*n_class
+            mask = torch.eq(labels, torch.transpose(class_center_labels, 0, 1)).float().to(self.device)
         else:
-            mask = mask.float().cuda()
-        # n_sample = batch_size * fea_h * fea_w
-        # mask n_sample*n_class  the mask_ij represents whether the i-th sample has the same label with j-th class or not.
-        # in our experiment, the n_view = 1, so the contrast_count = 1
-        contrast_count = features.shape[1]  # 1
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # [n*h*w]*fea_s
-
-        anchor_feature = contrast_feature  # [B * H * W] * C
-        anchor_count = contrast_count  # 1
-
-        """compute logits"""
-        # dot product between the individual features and the class centroids, cos(a)
-        cosine = torch.matmul(anchor_feature, class_center_feas)  # [n*h*w] * n_class
+            mask = mask.float().to(self.device)
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+        cosine = torch.matmul(anchor_feature, class_center_feas)
         logits = torch.div(cosine, self.temperature)
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
-
         sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0.0001, 1.0))
-        """cos(a + m)"""
         phi = cosine * self.cos_m - sine * self.sin_m
-
         if self.easy_margin:
             phi = torch.where(cosine > 0, phi, cosine)
         else:
             phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-        # print(phi)
         phi_logits = torch.div(phi, self.temperature)
-
         phi_logits_max, _ = torch.max(phi_logits, dim=1, keepdim=True)
         phi_logits = phi_logits - phi_logits_max.detach()
-
         mask = mask.repeat(anchor_count, contrast_count)
-
         tag_1 = (1 - mask)
         tag_2 = mask
-        """the elements of the denominator"""
-        exp_logits = torch.exp(logits * tag_1 + phi_logits * tag_2)  # [B * H * W] * #class
-        phi_logits = (logits * tag_1) + (phi_logits * tag_2)  # [B * H * W] * #class
-        """log(exp(phi_logits) / exp_logits.sum(1)). contrastive loss for each pixel."""
-        log_prob = phi_logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-4)  # [B * H * W] * #class
-
+        exp_logits = torch.exp(logits * tag_1 + phi_logits * tag_2)
+        phi_logits = (logits * tag_1) + (phi_logits * tag_2)
+        log_prob = phi_logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-4)
         if pixel_sel_loc is not None:
-
             pixel_sel_loc = pixel_sel_loc.view(-1)
-
             mean_log_prob_pos = (mask * log_prob).sum(1)
             mean_log_prob_pos = pixel_sel_loc * mean_log_prob_pos
             loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
             loss = torch.div(loss.sum(), pixel_sel_loc.sum() + 1e-4)
         else:
-
-            mean_log_prob_pos = (mask * log_prob).sum(1)  # [B * H * W]
-            # loss
+            mean_log_prob_pos = (mask * log_prob).sum(1)
             loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
             loss = loss.view(anchor_count, num_samples).mean()
-
         return loss
 
 
 def mpcl_loss_calc(feas, labels, class_center_feas, loss_func,
                    pixel_sel_loc=None, tag='source'):
-    '''
-    feas:  batch*c*h*w
-    label: batch*img_h*img_w
-    class_center_feas: n_class*n_feas
-    '''
-
     n, c, fea_h, fea_w = feas.size()
     if tag == 'source' and (labels.size()[1] != fea_h or labels.size()[2] != fea_w):
         labels = labels.float()
-        labels = F.interpolate(labels, size=fea_w, mode='nearest')
-        labels = labels.permute(0, 2, 1).contiguous()
-        labels = F.interpolate(labels, size=fea_h, mode='nearest')
-        labels = labels.permute(0, 2, 1).contiguous()  # batch*fea_h*fea_w
-
-    labels = labels.cuda()
+        labels = F.interpolate(labels.unsqueeze(1), size=(fea_h, fea_w), mode='nearest').squeeze(1)
+    labels = labels.to(feas.device)
     labels = labels.view(-1).long()
-
     feas = torch.nn.functional.normalize(feas, p=2, dim=1)
-    feas = feas.transpose(1, 2).transpose(2, 3).contiguous()  # batch*c*h*w->batch*h*c*w->batch*h*w*c
-    feas = torch.reshape(feas, [n * fea_h * fea_w, c])  # [batch*h*w] * c
-    feas = feas.unsqueeze(1)  # [batch*h*w] 1 * c
-
+    feas = feas.transpose(1, 2).transpose(2, 3).contiguous()
+    feas = torch.reshape(feas, [n * fea_h * fea_w, c])
+    feas = feas.unsqueeze(1)
     class_center_feas = torch.nn.functional.normalize(class_center_feas, p=2, dim=1)
-    class_center_feas = torch.transpose(class_center_feas, 0, 1)  # n_fea*n_class
-
+    class_center_feas = torch.transpose(class_center_feas, 0, 1)
     loss = loss_func(feas, labels, class_center_feas,
                      pixel_sel_loc=pixel_sel_loc)
     return loss
 
 
 def batch_pairwise_dist(x, y):
-    # N, 2500, 3 | 8, 300, 3
     bs, num_points, points_dim = x.size()
-    xx = torch.bmm(x, x.transpose(2, 1))  # x^2 (N * 300 * 300)
-    yy = torch.bmm(y, y.transpose(2, 1))  # y^2
-    zz = torch.bmm(x, y.transpose(2, 1))  # xy
-    diag_ind = torch.arange(0, num_points).long().cuda()
-    rx = xx[:, diag_ind, diag_ind]  # (N, 300)
-    rx = rx.unsqueeze(1)  # (N, 1, 300)
+    xx = torch.bmm(x, x.transpose(2, 1))
+    yy = torch.bmm(y, y.transpose(2, 1))
+    zz = torch.bmm(x, y.transpose(2, 1))
+    diag_ind = torch.arange(0, num_points, device=x.device).long()
+    rx = xx[:, diag_ind, diag_ind]
+    rx = rx.unsqueeze(1)
     rx = rx.expand_as(xx)
     ry = yy[:, diag_ind, diag_ind].unsqueeze(1).expand_as(yy)
-    P = (rx.transpose(2, 1) + ry - 2 * zz).clip(min=0)  # (x - y)^2 = x^2 + y^2 - 2xy
+    P = (rx.transpose(2, 1) + ry - 2 * zz).clamp(min=0)
     return P
 
 
 def batch_NN_loss(x, y):
     smooth = 1e-7
     bs, num_points, points_dim = x.size()
-    dist1 = torch.sqrt(batch_pairwise_dist(x, y) + smooth)  # (N, 300, 300)
-    values1, indices1 = dist1.min(dim=2)  # (N, 300)
-
+    dist1 = torch.sqrt(batch_pairwise_dist(x, y) + smooth)
+    values1, indices1 = dist1.min(dim=2)
     dist2 = torch.sqrt(batch_pairwise_dist(y, x) + smooth)
     values2, indices2 = dist2.min(dim=2)
     a = torch.div(torch.sum(values1, 1), num_points)
     b = torch.div(torch.sum(values2, 1), num_points)
     sum = torch.div(torch.sum(a), bs) + torch.div(torch.sum(b), bs)
-
     return sum
