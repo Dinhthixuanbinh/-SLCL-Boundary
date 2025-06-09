@@ -387,7 +387,8 @@ class Trainer_MPSCL(Trainer_Advent):
             print(f"Error loading initial source centroids: {e}")
             sys.exit(1)
 
-        self._update_teacher_network() 
+        self.prepare_model()
+        self._update_teacher_network()
 
         for epoch in tqdm(range(self.start_epoch, self.args.epochs), desc="Training Epochs"):
             epoch_start = datetime.now()
