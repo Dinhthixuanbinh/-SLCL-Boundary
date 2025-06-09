@@ -13,7 +13,7 @@ import torch.nn as nn
 """utils import"""
 from utils.loss import loss_calc, MPCL, dice_loss, mpcl_loss_calc, jaccard_loss, ContrastiveLoss
 from utils.utils_ import update_class_center_iter, generate_pseudo_label, prob_2_entropy, cal_centroid
-
+from utils import timer 
 """evaluator import"""
 from evaluator import Evaluator
 
