@@ -170,14 +170,9 @@ class Trainer_MPSCL(Trainer_Advent):
                 teacher_pred_t_main, teacher_pred_t_aux, teacher_dcdr_ft_t = self.teacher_segmentor(img_t, features_out=True)
                 teacher_pred_t_softmax_main = F.softmax(teacher_pred_t_main, dim=1)
 
-                entropy_map = prob_2_entropy(teacher_pred_t_softmax_main)
-
-                max_probs, _ = torch.max(teacher_pred_t_softmax_main, dim=1, keepdim=True)
-                distributional_uncertainty_proxy = 1.0 - max_probs
-
-                total_uncertainty_map = self.args.eta_1 * entropy_map + self.args.eta_2 * distributional_uncertainty_proxy
-                
-                reliability_map_continuous = calculate_juq_reliability_map(total_uncertainty_map, self.args.juq_temp, self.args.juq_thd)
+                reliability_map_continuous = calculate_juq_reliability_map(
+                    teacher_pred_t_softmax_main, self.args.eta_1, self.args.eta_2
+                )
 
                 reliable_pseudo_labels_soft = teacher_pred_t_softmax_main * reliability_map_continuous
 
