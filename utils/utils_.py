@@ -667,42 +667,35 @@ def prob_2_entropy(prob, smooth=1e-7):
     entropy_map = -torch.mul(prob, torch.log2(prob + smooth)).sum(dim=1, keepdim=True)
     return entropy_map # Shape (N, 1, H, W)
 
-def calculate_juq_reliability_map(raw_pseudo_labels_softmax: torch.Tensor, smooth=1e-7) -> torch.Tensor:
-    """
-    Calculates the Joint Uncertainty Quantification (JUQ) reliability map.
-    This function implements JUQ by combining normalized entropy-based uncertainty
-    and a proxy for distributional uncertainty (based on max probability/confidence).
+def calculate_juq_reliability_map(teacher_pred_t_softmax_main: torch.Tensor, eta_1: float, eta_2: float, smooth=1e-7) -> torch.Tensor:
+    N, C, H, W = teacher_pred_t_softmax_main.shape
 
-    Args:
-        raw_pseudo_labels_softmax (torch.Tensor): Raw softmax predictions for target domain (N, C, H, W).
-        smooth (float): Small value for numerical stability.
-    Returns:
-        torch.Tensor: Reliability map (N, 1, H, W) where higher values mean more reliable.
-                      Values are normalized to be between 0 and 1.
-    """
-    # Ensure input is softmax probabilities
-    if not torch.allclose(raw_pseudo_labels_softmax.sum(dim=1), torch.ones_like(raw_pseudo_labels_softmax[:, 0, :, :]), atol=1e-4):
-        raw_pseudo_labels_softmax = F.softmax(raw_pseudo_labels_softmax, dim=1)
+    # Step 1: Entropy Uncertainty Calculation
+    u_entropy = prob_2_entropy(teacher_pred_t_softmax_main, smooth=smooth) # (N, 1, H, W)
 
-    # 1. Entropy-based Uncertainty (U_entropy)
-    U_entropy_raw = prob_2_entropy(raw_pseudo_labels_softmax, smooth=smooth) # (N, 1, H, W)
-    sum_U_entropy_raw_per_batch = U_entropy_raw.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
-    U_entropy_norm = 1 - (U_entropy_raw / (sum_U_entropy_raw_per_batch + smooth))
-    U_entropy_norm = torch.clamp(U_entropy_norm, 0, 1)
+    # Step 2: Distributional Uncertainty Calculation (variance)
+    p_mean = torch.mean(teacher_pred_t_softmax_main, dim=1, keepdim=True)
+    u_dist = torch.sum(torch.square(teacher_pred_t_softmax_main - p_mean), dim=1, keepdim=True)
 
-    # 2. Distributional Uncertainty (U_Dis-norm)
-    max_prob, _ = torch.max(raw_pseudo_labels_softmax, dim=1, keepdim=True) # (N, 1, H, W)
-    U_Dis_raw_proxy = 1 - max_prob
-    sum_U_Dis_raw_proxy_per_batch = U_Dis_raw_proxy.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
-    U_Dis_norm = torch.exp(-(U_Dis_raw_proxy / (sum_U_Dis_raw_proxy_per_batch + smooth)))
-    U_Dis_norm = torch.clamp(U_Dis_norm, 0, 1)
+    # Flatten for global min/max
+    u_entropy_flat = u_entropy.view(N, -1)
+    u_dist_flat = u_dist.view(N, -1)
 
-    # 3. Joint Uncertainty Quantification (JUQ)
-    juq_map = U_Dis_norm * U_entropy_norm
-    min_juq = juq_map.min(dim=3, keepdim=True).values.min(dim=2, keepdim=True).values # (N, 1, 1, 1)
-    max_juq = juq_map.max(dim=3, keepdim=True).values.max(dim=2, keepdim=True).values # (N, 1, 1, 1)
-    juq_map_normalized = (juq_map - min_juq) / (max_juq - min_juq + smooth)
-    return juq_map_normalized # Shape (N, 1, H, W)
+    global_u_entropy_min = u_entropy_flat.min()
+    global_u_entropy_max = u_entropy_flat.max()
+    global_u_dist_min = u_dist_flat.min()
+    global_u_dist_max = u_dist_flat.max()
+
+    u_entropy_norm = (u_entropy - global_u_entropy_min) / (global_u_entropy_max - global_u_entropy_min + smooth)
+    u_dist_norm = (u_dist - global_u_dist_min) / (global_u_dist_max - global_u_dist_min + smooth)
+
+    u_entropy_norm = torch.clamp(u_entropy_norm, 0.0, 1.0)
+    u_dist_norm = torch.clamp(u_dist_norm, 0.0, 1.0)
+
+    combined_uncertainty = eta_1 * u_entropy_norm + eta_2 * u_dist_norm
+    reliability_map = 1.0 - combined_uncertainty
+    reliability_map = torch.clamp(reliability_map, 0.0, 1.0)
+    return reliability_map
 
 
 def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_softmax):
