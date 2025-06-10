@@ -12,7 +12,7 @@ import torch.nn as nn
 
 """utils import"""
 from utils.loss import loss_calc, MPCL, dice_loss, mpcl_loss_calc, jaccard_loss, ContrastiveLoss
-from utils.utils_ import update_class_center_iter, generate_pseudo_label, prob_2_entropy, cal_centroid
+from utils.utils_ import update_class_center_iter, generate_pseudo_label, prob_2_entropy, cal_centroid, calculate_juq_reliability_map
 from utils import timer 
 """evaluator import"""
 from evaluator import Evaluator
@@ -34,7 +34,7 @@ class Trainer_MPSCL(Trainer_Advent):
 
         self.parser.add_argument('-src_temp', type=float, default=0.1)
         self.parser.add_argument('-src_base_temp', type=float, default=1)
-        self.parser.add_argument('-trg_temp', type=float, default=0.1)
+        self.parser.add_argument('-trg_temp', type=float, default=0.07)
         self.parser.add_argument('-trg_base_temp', type=float, default=1)
         self.parser.add_argument('-src_margin', type=float, default=.4)
         self.parser.add_argument('-trg_margin', type=float, default=.2)
@@ -47,12 +47,12 @@ class Trainer_MPSCL(Trainer_Advent):
 
         self.parser.add_argument('-dis_type', type=str, default='origin')
 
-        self.parser.add_argument('-w_cl', type=float, default=1.0, help='Weight for Contrastive Loss (L_CL)')
-        self.parser.add_argument('-w_cnr', type=float, default=0.01, help='Weight for Centroid Norm Regularizer Loss (L_CNR)')
+        self.parser.add_argument('-w_cl', type=float, default=0.6, help='Weight for Contrastive Loss (L_CL)')
+        self.parser.add_argument('-w_cnr', type=float, default=0.05, help='Weight for Centroid Norm Regularizer Loss (L_CNR)')
         self.parser.add_argument('-juq_temp', type=float, default=1.0, help='Temperature for JUQ entropy calculation')
         self.parser.add_argument('-juq_thd', type=float, default=0.8, help='Threshold for JUQ reliability map (e.g., 0.8 for 80% certainty)')
-        self.parser.add_argument('-eta_1', type=float, default=0.1, help='Weight for entropy uncertainty in JUQ')
-        self.parser.add_argument('-eta_2', type=float, default=0.1, help='Weight for distributional uncertainty in JUQ')
+        self.parser.add_argument('-eta_1', type=float, default=0.6, help='Weight for entropy uncertainty in JUQ')
+        self.parser.add_argument('-eta_2', type=float, default=0.4, help='Weight for distributional uncertainty in JUQ')
         self.parser.add_argument('-momentum_teacher', type=float, default=0.99, help='EMA momentum for teacher network update')
 
         if '-part' not in self.parser._option_string_actions:
@@ -61,6 +61,8 @@ class Trainer_MPSCL(Trainer_Advent):
         if '-CNR_w' not in self.parser._option_string_actions:
              self.parser.add_argument('-CNR_w', type=float, default=0.0,
                                       help='Weight for CNR loss (set via cmd/hardcode)')
+
+        self.parser.add_argument('-min_reliability_for_rmc', type=float, default=0.5, help='Minimum reliability for rMC partitioning')
 
     def get_arguments_apdx(self):
         super(Trainer_MPSCL, self).get_basic_arguments_apdx(name='JUQ_UDA')
@@ -134,6 +136,8 @@ class Trainer_MPSCL(Trainer_Advent):
         partition_num = getattr(self.args, 'part', 1)
         cnr_weight = getattr(self.args, 'CNR_w', 0.0)
 
+        min_reliability_for_rmc = self.args.min_reliability_for_rmc
+
         for batch_content, batch_style in zip(self.content_loader, self.style_loader):
             self.opt_d.zero_grad()
             self.opt.zero_grad()
@@ -173,12 +177,10 @@ class Trainer_MPSCL(Trainer_Advent):
 
                 total_uncertainty_map = self.args.eta_1 * entropy_map + self.args.eta_2 * distributional_uncertainty_proxy
                 
-                reliability_map_binary = (max_probs >= self.args.juq_thd).float()
+                reliability_map_continuous = calculate_juq_reliability_map(total_uncertainty_map, self.args.juq_temp, self.args.juq_thd)
 
-                reliable_pseudo_labels_raw = teacher_pred_t_softmax_main * reliability_map_binary
+                reliable_pseudo_labels_soft = teacher_pred_t_softmax_main * reliability_map_continuous
 
-                reliable_pseudo_labels_hard = torch.argmax(reliable_pseudo_labels_raw, dim=1)
-                
                 student_pred_t_main, student_pred_t_aux, student_dcdr_ft_t = self.segmentor(img_t, features_out=True)
 
             self.centroid_s, _, _ = cal_centroid(dcdr_ft_s.detach(), labels_s,
@@ -187,7 +189,7 @@ class Trainer_MPSCL(Trainer_Advent):
                                                  pseudo_label=False,
                                                  n_class=self.args.num_classes)
 
-            reliable_pixel_mask = reliability_map_binary.squeeze(1).bool()
+            reliable_pixel_mask = reliability_map_continuous.squeeze(1).bool()
             
             reliable_indices = torch.nonzero(reliable_pixel_mask, as_tuple=True)
             
@@ -214,8 +216,8 @@ class Trainer_MPSCL(Trainer_Advent):
                         partition_mask2[:, reliable_indices[i_dim][partition2_indices_flat]] = True
 
                 flattened_student_ft = student_dcdr_ft_t.permute(0, 2, 3, 1).reshape(-1, student_dcdr_ft_t.shape[1])
-                flattened_reliable_pl = reliable_pseudo_labels_raw.permute(0, 2, 3, 1).reshape(-1, self.args.num_classes)
-                flattened_reliability_mask = reliability_map_binary.flatten()
+                flattened_reliable_pl = reliable_pseudo_labels_soft.permute(0, 2, 3, 1).reshape(-1, self.args.num_classes)
+                flattened_reliability_mask = reliability_map_continuous.flatten()
                 
                 filtered_student_ft = flattened_student_ft[flattened_reliability_mask.bool()]
                 filtered_reliable_pl = flattened_reliable_pl[flattened_reliability_mask.bool()]
