@@ -467,20 +467,9 @@ def check_bit_generator():
 
 def cal_centroid(decoder_ft, label, previous_centroid=None, momentum=0.95, pseudo_label=False, n_class=4, partition=1,
                  threshold: int = None, thd_w: float = config.WEIGHT_THD, weighted_ave=False, epoch=0, max_epoch=1000,
-                 low_thd = 0, high_thd=0.99, stdmin=False):
+                 low_thd = 0, high_thd=0.99, stdmin=False, pixel_mask=None):
     """
-    For source samples, previous
-    :param partition: number of partitions of the centroid (only used for target features)
-    :param decoder_ft: (N, 32, 256, 256)
-    :param label: (N, 4, 256, 256)
-    :param previous_centroid: None or (4, 32)
-    :param momentum: for moving average (centroid = previous_centroid * momentum + (1 - momentum) * centroid)
-    :param pseudo_label: the soft prediction of the original target images
-    :param n_class: number of classes
-    :param threshold: The threshold to mask out the uncertain pixels
-    :param thd_w: The weight when calculating the adaptive threshold
-    :param weighted_ave: Whether to calculate weighted average of the features as the centroids
-    :return: the centroid of each class, ratio (the ratio of the number of features larger than the threshold)
+    Extended: If pixel_mask is provided, use it to weight the features and labels for centroid calculation (for JUQ reliability weighting).
     """
     shape_ft = decoder_ft.size()
     shape_label = label.size()
@@ -496,11 +485,16 @@ def cal_centroid(decoder_ft, label, previous_centroid=None, momentum=0.95, pseud
                 label_temp = F.interpolate(label_temp, (shape_ft[-2], shape_ft[-1]), align_corners=True,
                                            mode='bilinear')
     ratio = None
-    stddevs = []  # bg, myo, lv, rv
+    stddevs = []
+    # If pixel_mask is provided, apply it to label_temp for weighted centroid calculation
+    if pixel_mask is not None:
+        # pixel_mask should be (N, 1, H, W) or (N, H, W)
+        if pixel_mask.dim() == 3:
+            pixel_mask = pixel_mask.unsqueeze(1)
+        label_temp = label_temp * pixel_mask
     if pseudo_label:
         pred_max = torch.max(label_temp, dim=1, keepdim=True).values  # (N, 1, 224 ,224)
         pred_mask = torch.ones_like(pred_max)
-        # label_temp = label_temp  # (N, 4, 224, 224)
         pred_onehot = torch.where(label_temp == pred_max, 1, 0)  # (N, 4, 224, 224) one hot encoded pseudo label
         if threshold is not None:
             assert ((-1 <= threshold <= 1) or (threshold == 2) or (threshold == 3) or
@@ -617,6 +611,8 @@ def cal_centroid(decoder_ft, label, previous_centroid=None, momentum=0.95, pseud
         centroids = []
         for i in range(n_class):
             class_mask = torch.unsqueeze(torch.where(label_temp == i, 1, 0), 1)
+            if pixel_mask is not None:
+                class_mask = class_mask * pixel_mask
             ft = decoder_ft * class_mask
             centroids.append(torch.unsqueeze(torch.sum(ft, (0, 2, 3)) / (torch.sum(class_mask) + 1e-7), 0))
         centroids = torch.cat(centroids, dim=0)
@@ -698,7 +694,7 @@ def calculate_juq_reliability_map(teacher_pred_t_softmax_main: torch.Tensor, eta
     return reliability_map
 
 
-def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_softmax):
+def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_softmax, eta_1=0.6, eta_2=0.4):
     '''
     Generates pseudo-labels for target domain using JUQ for reliability assessment.
     Args:
@@ -706,22 +702,14 @@ def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_soft
         class_centers (torch.Tensor): Class prototypes (N_class, C_feat).
         pixel_sel_th (float): Original pixel selection threshold (not used in JUQ logic, kept for compatibility).
         pred_t_softmax (torch.Tensor): Softmax predictions for target images (N, C_class, H, W).
+        eta_1 (float): Weight for entropy uncertainty in JUQ.
+        eta_2 (float): Weight for distributional uncertainty in JUQ.
     Returns:
         tuple: (hard_pixel_label, reliability_map)
             hard_pixel_label (torch.Tensor): Argmax pseudo-labels (N, H, W).
             reliability_map (torch.Tensor): JUQ-derived reliability map (N, 1, H, W).
     '''
-    # Normalize features and class centers for cosine similarity (not used for mask, but for compatibility)
-    cla_feas_trg_de = cla_feas_trg.detach()
-    batch, N_fea, H, W = cla_feas_trg_de.size()
-    cla_feas_trg_de = F.normalize(cla_feas_trg_de, p=2, dim=1)
-    class_centers_norm = F.normalize(class_centers, p=2, dim=1)
-    # Reshape features for matrix multiplication with class centers (not used for mask)
-    cla_feas_trg_de_reshaped = cla_feas_trg_de.permute(0, 2, 3, 1).contiguous().view(-1, N_fea) # (N*H*W, N_fea)
-    class_centers_norm_transposed = class_centers_norm.transpose(0, 1) # (N_fea, N_class)
-    # Calculate JUQ reliability map
-    reliability_map = calculate_juq_reliability_map(pred_t_softmax) # (N, 1, H, W)
-    # Determine hard pseudo-labels (argmax of softmax predictions)
+    reliability_map = calculate_juq_reliability_map(pred_t_softmax, eta_1, eta_2) # (N, 1, H, W)
     hard_pixel_label = torch.argmax(pred_t_softmax, dim=1) # (N, H, W)
     return hard_pixel_label, reliability_map
 # --- JUQ-based pseudo-label generation end ---
