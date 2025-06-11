@@ -83,6 +83,7 @@ class Trainer_MPSCL(Trainer_Advent):
              self.apdx += f'.p{part_num}'
         if cnr_weight > 0:
              self.apdx += f'.cnr{cnr_weight}'
+             
 
     @timer.timeit
     def prepare_model(self):
@@ -178,13 +179,9 @@ class Trainer_MPSCL(Trainer_Advent):
 
                 student_pred_t_main, student_pred_t_aux, student_dcdr_ft_t = self.segmentor(img_t, features_out=True)
 
-            self.centroid_s, _, _ = cal_centroid(dcdr_ft_s.detach(), labels_s,
-                                                 previous_centroid=self.centroid_s,
-                                                 momentum=self.args.class_center_m,
-                                                 pseudo_label=False,
-                                                 n_class=self.args.num_classes)
+            self.centroid_s, _, _ = cal_centroid(dcdr_ft_s.detach(), labels_s, previous_centroid=self.centroid_s, momentum=self.args.class_center_m, n_class=self.args.num_classes, reliability_map=None)
 
-            reliable_pixel_mask = reliability_map_continuous.squeeze(1).bool()
+            reliable_pixel_mask = (reliability_map_continuous.squeeze(1) >= min_reliability_for_rmc)
             
             reliable_indices = torch.nonzero(reliable_pixel_mask, as_tuple=True)
             

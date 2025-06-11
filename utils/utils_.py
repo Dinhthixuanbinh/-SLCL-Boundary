@@ -465,157 +465,53 @@ def check_bit_generator():
         print("numpy.random.bit_generator exists")
 
 
-def cal_centroid(decoder_ft, label, previous_centroid=None, momentum=0.95, pseudo_label=False, n_class=4, partition=1,
-                 threshold: int = None, thd_w: float = config.WEIGHT_THD, weighted_ave=False, epoch=0, max_epoch=1000,
-                 low_thd = 0, high_thd=0.99, stdmin=False, pixel_mask=None):
+def cal_centroid(
+    decoder_ft, label, previous_centroid=None, momentum=0.95, pseudo_label=False, n_class=4, partition=1,
+    threshold: int = None, thd_w: float = config.WEIGHT_THD, weighted_ave=False, epoch=0, max_epoch=1000,
+    low_thd=0, high_thd=0.99, stdmin=False, pixel_mask=None
+):
     """
-    Extended: If pixel_mask is provided, use it to weight the features and labels for centroid calculation (for JUQ reliability weighting).
+    Calculates centroids for each class.
+    If pixel_mask is provided, it is used as a soft weighting (e.g., JUQ reliability map).
+    For source, label is ground truth (N, H, W) and pixel_mask is None.
+    For target, label is argmax pseudo-label (N, H, W) and pixel_mask is the JUQ reliability map (N, 1, H, W).
     """
     shape_ft = decoder_ft.size()
     shape_label = label.size()
     label_temp = label
     if shape_label[-1] != shape_ft[-1] or shape_label[-2] != shape_ft[-2]:
         if label.ndim == 3:
-            if shape_ft[-2] != label_temp.size()[-2] or shape_ft[-1] != label_temp.size()[-1]:
-                label_temp = torch.squeeze(
-                    F.interpolate(torch.unsqueeze(label_temp, dim=1), (shape_ft[-2], shape_ft[-1]),
-                                  mode='nearest'), dim=1)
+            label_temp = torch.squeeze(
+                F.interpolate(torch.unsqueeze(label_temp, dim=1), (shape_ft[-2], shape_ft[-1]), mode='nearest'), dim=1)
         elif label.ndim == 4:
-            if shape_ft[-2] != label_temp.size()[-2] or shape_ft[-1] != label_temp.size()[-1]:
-                label_temp = F.interpolate(label_temp, (shape_ft[-2], shape_ft[-1]), align_corners=True,
-                                           mode='bilinear')
+            label_temp = F.interpolate(label_temp, (shape_ft[-2], shape_ft[-1]), align_corners=True, mode='bilinear')
+
+    centroids = []
     ratio = None
     stddevs = []
-    # If pixel_mask is provided, apply it to label_temp for weighted centroid calculation
+
     if pixel_mask is not None:
-        # pixel_mask should be (N, 1, H, W) or (N, H, W)
+        # Use pixel_mask (N, 1, H, W) as soft weighting for each class
         if pixel_mask.dim() == 3:
             pixel_mask = pixel_mask.unsqueeze(1)
-        label_temp = label_temp * pixel_mask
-    if pseudo_label:
-        pred_max = torch.max(label_temp, dim=1, keepdim=True).values  # (N, 1, 224 ,224)
-        pred_mask = torch.ones_like(pred_max)
-        pred_onehot = torch.where(label_temp == pred_max, 1, 0)  # (N, 4, 224, 224) one hot encoded pseudo label
-        if threshold is not None:
-            assert ((-1 <= threshold <= 1) or (threshold == 2) or (threshold == 3) or
-                    (threshold == -2)), 'The threshold should between [-1, 1] U {-2, 2, 3}.'
-            if threshold == -1:  # only keep the largest component in the prediction mask
-                label_binary = torch.unsqueeze(torch.where(torch.argmax(label_temp, dim=1) > .5, 1, 0),
-                                               1).float()  # (N, 1, 224, 224) pseudo labels except the background
-                blobs = connected_components(label_binary.detach())  # (N, 1, 224, 224)
-                for i in range(len(blobs)):
-                    size_list = []
-                    for num_blob in (torch.unique(blobs[i])[1:].cpu().numpy()):
-                        size_list.append(int(torch.sum(torch.where(blobs[i] == num_blob, 1, 0)).cpu()))
-                    if len(size_list) == 0:
-                        continue
-                    num_largest_blob = torch.unique(blobs[i])[np.argmax(size_list) + 1]
-                    blobs[i] = torch.where(blobs[i] == num_largest_blob, 1, 0)
-                pred_mask = blobs
-            else:
-                """extract the max value among the 4 features of each feature vector (excluded background)"""
-                cardiac_mask = ~(pred_max == torch.unsqueeze(label_temp[:, 0], 1))
-                cardiac_coor = torch.where(cardiac_mask == 1)
-                """calculate the adaptive threshold with the weight thd_w. Default thd_w = 0."""
-                if threshold == 1:  # adaptive threshold
-                    """calculate the mean and std of the max values"""
-                    mean, std = torch.mean(pred_max[cardiac_coor]).detach().cpu().numpy(), torch.std(
-                        pred_max[cardiac_coor]).detach().cpu().numpy()
-                    threshold = float(np.clip(mean + thd_w * std, 0, 1))
-                if threshold == 3:  # select the features whose prediction is less than .6
-                    pred_mask = torch.where(pred_max <= .6, 1, 0)
-                elif threshold == 2:  # select the features whose prediction less than .4 or greater than .9
-                    pred_mask = torch.where(pred_max <= .4, 1, 0) | torch.where(pred_max >= .9, 1, 0)
-                elif threshold == -2:  # curriculum learning
-                    thd = max(high_thd * (1 - epoch / max_epoch), low_thd)
-                    pred_mask = torch.where(pred_max >= thd, 1, 0)
-                elif -1 < threshold < 0:
-                    if len(cardiac_coor) > 0:
-                        tmp = pred_max[cardiac_coor].flatten().sort().values  # ascending order (small -> large)
-                        threshold = tmp[int(-threshold * len(tmp))]
-                        pred_mask = torch.where(pred_max >= threshold, 1, 0)
-                    else:
-                        pred_mask = torch.zeros_like(pred_max)
-                else:
-                    # (N, 1, 224 ,224) find the pixels whose certainty is greater than the threshold
-                    pred_mask = torch.where(pred_max >= threshold, 1, 0)
-                ratio = pred_mask[cardiac_coor].sum() / (len(cardiac_coor[0]) + 1e-7)
-            # (N, 4, 224, 224) mask the pixels whose prediction is greater than the threshold
-            label_temp = label_temp * pred_mask
-        if partition == 1:
-            centroids = []
-            if weighted_ave:
-                for i in range(n_class):
-                    ft = decoder_ft * torch.unsqueeze(label_temp[:, i], 1)
-                    sum_i = (torch.sum(label_temp[:, i]) + 1e-7)
-                    centroid = torch.unsqueeze(torch.sum(ft, (0, 2, 3)) / sum_i, 0)
-                    centroids.append(centroid)
-                    if stdmin:
-                        stddev = torch.square((decoder_ft - centroid[:, :, None, None]))
-                        stddev = torch.sum(stddev * torch.unsqueeze(label_temp[:, i], 1), (0, 2, 3))
-                        stddevs.append(stddev.mean() / sum_i)
-            else:
-                for i in range(n_class):
-                    ft = decoder_ft * torch.unsqueeze(pred_onehot[:, i], 1) * pred_mask
-                    sum_i = torch.sum(torch.unsqueeze(pred_onehot[:, i], 1) * pred_mask)
-                    centroid = torch.unsqueeze(torch.sum(ft, (0, 2, 3)) / sum_i, 0)
-                    centroids.append(centroid)
-                    if stdmin:
-                        stddev = torch.square((decoder_ft - centroid[:, :, None, None]) * torch.unsqueeze(pred_onehot[:, i], 1) * pred_mask)
-                        stddevs.append(torch.sum(stddev, (0, 2, 3)).mean() / sum_i)
-            centroids = [torch.cat(centroids, dim=0)]
-        else:
-            size = label_temp.size()  # (N, 4, 224, 224)
-            centroids = []
-            for i in range(pred_onehot.size()[1]):
-                substds = []
-                indices_1 = torch.where(pred_onehot[:, i] == 1)
-                indices_1 = torch.stack(list(indices_1), dim=1)  # (M, 3)
-                len_1 = indices_1.size()[0]  # M
-                idx_split_1 = torch.tensor_split(torch.randperm(len_1), partition)
-                indices_0 = torch.where(pred_onehot[:, i] == 0)
-                indices_0 = torch.stack(list(indices_0), dim=1)  # (K, 3)
-                len_0 = indices_0.size()[0]  # K
-                idx_split_0 = torch.tensor_split(torch.randperm(len_0), partition)
-                partition_collector = []
-                for split_1, split_0 in zip(idx_split_1, idx_split_0):
-                    idx_1_part = indices_1[split_1, :]
-                    idx_0_part = indices_0[split_0, :]
-                    idx_part = torch.concat([idx_1_part, idx_0_part], dim=0).transpose(0, 1)
-                    idx_part = tuple(idx_part)
-                    mask = torch.zeros(size[0], size[2], size[3]).cuda()
-                    mask[idx_part] = 1
-                    mask = mask.unsqueeze(1)  # (N, 1, 224, 224) mask for one partition
-                    # mask = mask * pred_mask  # (N, 1, 224, 224) mask out the pixels under the specified certainty
-                    if weighted_ave:
-                        pred_max_select = label_temp[:, i][idx_part]
-                        centroid = torch.sum(decoder_ft * (torch.unsqueeze(label_temp[:, i], 1) * mask), (0, 2, 3)) \
-                                   / (torch.sum(pred_max_select) + 1e-7)
-                        if stdmin:
-                            stddev = torch.square((decoder_ft - centroid[None, :, None, None]) * mask)
-                            stddev = torch.sum(stddev * torch.unsqueeze(label_temp[:, i], 1), (0, 2, 3))
-                            substds.append(stddev.mean() / (torch.sum(pred_max_select) + 1e-7))
-                    else:
-                        ft_mask = torch.unsqueeze(pred_onehot[:, i], 1) * pred_mask * mask
-                        ft = decoder_ft * ft_mask
-                        sum_i = torch.sum(ft_mask)
-                        centroid = torch.sum(ft, (0, 2, 3)) / (sum_i + 1e-7)
-                        if stdmin:
-                            stddev = torch.square((decoder_ft - centroid[None, :, None, None]) * ft_mask)
-                            substds.append(torch.sum(stddev, (0, 2, 3)).mean() / sum_i)
-                    partition_collector.append(centroid)
-                partition_collector = torch.stack(partition_collector, dim=0)  # (P, 32)
-                centroids.append(partition_collector)
-            centroids = torch.stack(centroids, dim=1)  # (P, #cls, 32)
+        label_onehot = F.one_hot(label_temp.long(), num_classes=n_class).permute(0, 3, 1, 2).float()  # (N, C, H, W)
+        for i in range(n_class):
+            class_weighted_mask = label_onehot[:, i, :, :].unsqueeze(1) * pixel_mask  # (N, 1, H, W)
+            weighted_ft = decoder_ft * class_weighted_mask
+            sum_weights = torch.sum(class_weighted_mask) + 1e-7
+            centroid = torch.sum(weighted_ft, dim=(0, 2, 3)) / sum_weights  # (C_feat)
+            centroids.append(centroid.unsqueeze(0))
+        centroids = torch.cat(centroids, dim=0)  # (n_class, C_feat)
     else:
-        centroids = []
+        # Fallback to original logic for source or non-JUQ
         for i in range(n_class):
             class_mask = torch.unsqueeze(torch.where(label_temp == i, 1, 0), 1)
-            if pixel_mask is not None:
-                class_mask = class_mask * pixel_mask
             ft = decoder_ft * class_mask
-            centroids.append(torch.unsqueeze(torch.sum(ft, (0, 2, 3)) / (torch.sum(class_mask) + 1e-7), 0))
+            sum_mask = torch.sum(class_mask) + 1e-7
+            centroid = torch.sum(ft, dim=(0, 2, 3)) / sum_mask
+            centroids.append(centroid.unsqueeze(0))
         centroids = torch.cat(centroids, dim=0)
+
     if previous_centroid is not None:
         centroids = momentum * previous_centroid + (1 - momentum) * centroids
     return centroids, ratio, stddevs
@@ -688,7 +584,7 @@ def calculate_juq_reliability_map(raw_pseudo_labels_softmax: torch.Tensor, eta_1
     sum_U_entropy_raw_per_batch = U_entropy_raw.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
     # Handle cases where sum_U_entropy_raw_per_batch might be zero (e.g., all predictions are perfectly confident)
     U_entropy_norm = 1 - (U_entropy_raw / (sum_U_entropy_raw_per_batch + smooth))
-    U_entropy_norm = torch.clamp(U_entropy_norm, 0, 1) # Ensure values are within 
+    U_entropy_norm = torch.clamp(U_entropy_norm, 0, 1) # Ensure values are within 0-1 range
 
     # 2. Distributional Uncertainty (U_Dis-norm) - Formula (3) from EPCL-JUDA [1]
     # Interpreting Var(P_u, a_p) as variance of softmax probabilities across classes for each pixel
@@ -698,21 +594,19 @@ def calculate_juq_reliability_map(raw_pseudo_labels_softmax: torch.Tensor, eta_1
     sum_variance_per_batch = variance_across_classes.sum(dim=(2, 3), keepdim=True) # (N, 1, 1, 1)
     # Handle cases where sum_variance_per_batch might be zero (e.g., all predictions are identical)
     U_Dis_norm = torch.exp(-(variance_across_classes / (sum_variance_per_batch + smooth)))
-    U_Dis_norm = torch.clamp(U_Dis_norm, 0, 1) # Ensure values are within 
+    U_Dis_norm = torch.clamp(U_Dis_norm, 0, 1) # Ensure values are within 0-1 range
 
     # 3. Joint Uncertainty Quantification (JUQ) - Formula (5) from EPCL-JUDA [1]
-    # JUQ = U_Dis-norm * U_entropy-norm  <-- CORRECTED TO PRODUCT
+    # JUQ = U_Dis-norm * U_entropy-norm  <-- THIS IS THE CRITICAL CORRECTION
     juq_map = U_Dis_norm * U_entropy_norm
 
-    # Final normalization of JUQ map to  across the batch for consistent weighting
-    # This ensures the reliability map is always a valid weighting factor.
+    # Final normalization of JUQ map to 0-1 across the batch for consistent weighting
     min_juq = juq_map.min(dim=3, keepdim=True).values.min(dim=2, keepdim=True).values # (N, 1, 1, 1)
     max_juq = juq_map.max(dim=3, keepdim=True).values.max(dim=2, keepdim=True).values # (N, 1, 1, 1)
     # Handle cases where max_juq - min_juq might be zero (e.g., all pixels have same JUQ score)
     juq_map_normalized = (juq_map - min_juq) / (max_juq - min_juq + smooth)
     
     return juq_map_normalized # Shape (N, 1, H, W)
-
 
 def generate_pseudo_label(cla_feas_trg, class_centers, pixel_sel_th, pred_t_softmax, eta_1=0.6, eta_2=0.4):
     '''
