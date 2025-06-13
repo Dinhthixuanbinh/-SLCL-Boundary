@@ -39,25 +39,29 @@ class segmentation_models(nn.Module):
         self.args = args 
         self.multilvl = multilvl # From args, default False for baseline
 
-    def forward(self, x, features_out=True): # features_out is for compatibility
-        print(f"DEBUG: segmentation_models.forward (ULTRA-SIMPLIFIED) called with input shape {x.shape}")
+    def forward(self, x, features_out=True): # features_out is now crucial
+        # print(f"DEBUG: segmentation_models.forward called with input shape {x.shape}")
         
-        output_logits = self.smp_model(x) 
-        # smp.Unet directly returns: (batch_size, num_classes, height, width)
-        
-        print(f"DEBUG: smp_model(x) output shape: {output_logits.shape}")
+        # Standard smp.Unet forward pass steps (simplified to illustrate feature extraction)
+        encoder_features = self.smp_model.encoder(x)
+        # Typically, the decoder takes all encoder features.
+        # The last feature map from the decoder (before the head) is what we need.
+        decoder_output = self.smp_model.decoder(*encoder_features) # Unpack encoder features if decoder expects multiple
 
-        # Trainer_baseline.train_epoch does: pred = out[0] if isinstance(out, tuple) else out
-        # So returning a single tensor is fine for it.
+        # The segmentation_head is usually a Conv2d layer
+        output_logits = self.smp_model.segmentation_head(decoder_output)
         
-        # To maintain a 3-part return for potential use by Trainer_MCCL (pred, bottleneck, dcdr_ft):
-        if features_out or self.multilvl : # If MCCL trainer might be calling and expecting 3 outputs
-            # This is a placeholder for bottleneck. A true bottleneck would be features[-1]
-            bottleneck_placeholder = None 
-            # Placeholder for decoder features (dcdr_ft). True dcdr_ft would be before smp_model's head
-            dcdr_ft_placeholder = output_logits # Using logits as a stand-in
-            return output_logits, bottleneck_placeholder, dcdr_ft_placeholder
-        else: # For simple baseline that just wants the prediction
+        # print(f"DEBUG: smp_model(x) output shape: {output_logits.shape}")
+
+        if features_out:
+            # decoder_output is likely the 'decoder_features' (dcdr_ft) you need
+            # bottleneck_placeholder could be the last encoder feature or a pooled version
+            # For simplicity, let's return the last encoder feature for 'bottleneck'
+            # and the decoder_output for 'dcdr_ft'
+            bottleneck_feature = encoder_features[-1] # Assuming encoder_features is a list/tuple
+            dcdr_ft = decoder_output
+            return output_logits, bottleneck_feature, dcdr_ft
+        else:
             return output_logits
 
 

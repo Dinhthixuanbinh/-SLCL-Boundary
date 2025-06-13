@@ -94,31 +94,42 @@ class ImageProcessor:
 
     @staticmethod
     def simple_aug(image, mask, ang=(-15, 15), translate_x=(-0.1, 0.1), translate_y=(-0.1, 0.1), scale=(0.9, 1.1)):
-        # Your existing simple_aug implementation
-        # Ensure it correctly handles image and mask (possibly None)
-        # Make sure cv2.warpAffine borderValue is appropriate (float for image, int for mask)
-        # (Using the version from your provided code for consistency)
-        if image.ndim == 2: 
+        rows, cols = 0, 0
+        is_multichannel_input = False
+        
+        if image.ndim == 2: # (H, W)
             rows, cols = image.shape
             is_multichannel_input = False
-        elif image.ndim == 3 and image.shape[0] == 1: 
-            rows, cols = image.shape[1], image.shape[2]
-            image = image.squeeze(0) 
-            is_multichannel_input = True 
-            if mask is not None and mask.ndim == 3 and mask.shape[0] == 1:
-                mask = mask.squeeze(0)
-        elif image.ndim == 3 and image.shape[-1] == 1: 
-            rows, cols = image.shape[0], image.shape[1]
-            image = image.squeeze(-1)
-            is_multichannel_input = True
-            if mask is not None and mask.ndim == 3 and mask.shape[-1] == 1:
-                mask = mask.squeeze(-1)
-        elif image.ndim == 3 and image.shape[0] == 3: # (3, H, W)
-            rows, cols = image.shape[1], image.shape[2]
-            image = np.moveaxis(image, 0, -1) # C,H,W -> H,W,C for cv2
-            is_multichannel_input = True 
+        elif image.ndim == 3:
+            if image.shape[0] <= 3: # Likely (C, H, W) like (1, H, W) or (3, H, W)
+                rows, cols = image.shape[1], image.shape[2]
+                if image.shape[0] == 1: # Grayscale (1, H, W)
+                    image = image.squeeze(0)
+                    is_multichannel_input = False # Treat as 2D for affine, then re-add channel if needed
+                elif image.shape[0] == 3: # RGB (3, H, W)
+                    image = np.moveaxis(image, 0, -1) # Convert to HWC for cv2
+                    is_multichannel_input = True
+            elif image.shape[-1] <= 3: # Likely (H, W, C) like (H, W, 1) or (H, W, 3)
+                rows, cols = image.shape[0], image.shape[1]
+                if image.shape[-1] == 1: # Grayscale (H, W, 1)
+                    image = image.squeeze(-1)
+                    is_multichannel_input = False # Treat as 2D for affine, then re-add channel if needed
+                elif image.shape[-1] == 3: # RGB (H, W, 3)
+                    # Already in HWC format, no need to change for cv2
+                    is_multichannel_input = True
+            else:
+                raise ValueError(f"Unsupported image shape for simple_aug: {image.shape}") # 
         else:
-            raise ValueError(f"Unsupported image shape for simple_aug: {image.shape}")
+            raise ValueError(f"Unsupported image shape for simple_aug: {image.shape}") # 
+
+        # Handle mask shape to match image processing, assuming mask is 2D or (H,W,1) or (1,H,W)
+        if mask is not None:
+            if mask.ndim == 3:
+                if mask.shape[0] == 1: # (1,H,W)
+                    mask = mask.squeeze(0)
+                elif mask.shape[-1] == 1: # (H,W,1)
+                    mask = mask.squeeze(-1)
+        # --- MODIFIED SECTION END ---
 
         rand_ang = np.random.randint(ang[0], ang[1]) if ang[0] != ang[1] else ang[0]
         rand_tr_x = np.random.uniform(translate_x[0], translate_x[1]) if translate_x[0] != translate_x[1] else translate_x[0]
@@ -130,6 +141,7 @@ class ImageProcessor:
         M[1, 2] += rand_tr_y * rows
         
         border_value_img = image.min() if image.size > 0 else 0
+        # Ensure aug_image maintains channel dimension if input was multichannel
         aug_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=float(border_value_img))
         if mask is not None:
             aug_mask = cv2.warpAffine(mask, M, (cols, rows), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
@@ -141,10 +153,28 @@ class ImageProcessor:
             if aug_mask is not None:
                 aug_mask = cv2.flip(aug_mask, 1)
         
-        if is_multichannel_input and aug_image.ndim == 3 and image.ndim == 3 and image.shape[0]==3 : # If input was (3,H,W)
-            aug_image = np.moveaxis(aug_image, -1, 0) # H,W,C -> C,H,W
-        elif is_multichannel_input and aug_image.ndim == 2 and (image.ndim == 3 and (image.shape[0]==1 or image.shape[-1]==1)): # if input was (1,H,W) or (H,W,1)
-             pass # Becomes H,W. DataLoader will add channel dim if needed.
+        # --- MODIFIED RETURN SECTION START ---
+        # Ensure output matches expected format, especially for multichannel inputs
+        if is_multichannel_input and aug_image.ndim == 2: # If it was HWC originally and lost its channels (e.g. RGB became grayscale due to single channel in aug pipeline)
+            # This case might happen if cv2.warpAffine somehow flattens single channel image,
+            # but for (H,W,3) input, it should typically return (H,W,3) output.
+            # However, if original model assumed CHW, we should convert back to CHW here.
+            # Let's re-add channels if `image` was originally multichannel and is now 2D.
+            if image.ndim == 3 and image.shape[0] == 3: # Original was (3,H,W) or (H,W,3)
+                 aug_image = np.expand_dims(aug_image, axis=-1) # (H,W,1)
+                 aug_image = np.concatenate([aug_image, aug_image, aug_image], axis=-1) # (H,W,3)
+        
+        # This part ensures output matches the input's original channel dim position (CHW or HWC) if it started multichannel
+        # The previous version assumed it was always converting to (C,H,W) before returning.
+        # Given how `analyze_pseudo_label_consistency_batch` expects `np.moveaxis(aug_img_1_np, -1, 0)` later,
+        # ensure this function returns HWC if it started as HWC, then the caller handles CHW conversion.
+        # The simplest is to ensure output is always HWC if it was HWC, then the caller handles CHW conversion.
+        # As it stands now, `image` (after potential moveaxis) is always HWC for cv2 operations if multichannel.
+        # So, the output `aug_image` will also be HWC if it was multichannel.
+        # No explicit re-permute to CHW here if the input was HWC.
+        # The calling function `analyze_pseudo_label_consistency_batch` already does `np.moveaxis(aug_img_1_np, -1, 0)`
+        # assuming HWC output from simple_aug, which is correct with this fix.
+        # --- MODIFIED RETURN SECTION END ---
         
         return aug_image, aug_mask
 

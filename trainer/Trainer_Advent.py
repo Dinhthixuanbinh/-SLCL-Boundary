@@ -229,6 +229,21 @@ class Trainer_Advent(Trainer_AdapSeg):
                 self.writer.add_scalars('Dice/LGE', {'Valid': lge_dice, 'Test': lge_dice_test}, epoch + 1)
             else:
                 self.writer.add_scalar('Dice/LGE_valid', lge_dice, epoch + 1)
+            
+            # --- START MODIFICATION FOR PROPOSED METHOD LOGGING ---
+            self.writer.add_scalar('Loss/Seg_Source', train_results['seg_s'], epoch + 1)
+            self.writer.add_scalar('Loss/Consistency', train_results['consistency_loss'], epoch + 1)
+            self.writer.add_scalar('Loss/Prototype_Alignment', train_results['proto_loss'], epoch + 1)
+            
+            # If you still have discriminator losses (e.g., if Trainer_Proposed extends Trainer_Advent
+            # and doesn't remove D_main/D_aux entirely, just changes their use), add them here:
+            # self.writer.add_scalars('Acc/Dis', {'source': train_results['dis_acc_s'],
+            #                                      'target': train_results['dis_acc_t']}, epoch + 1)
+            # self.writer.add_scalar('Loss/Adv', train_results['loss_adv'], epoch + 1)
+            # self.writer.add_scalar('Loss/Dis', train_results['loss_dis'], epoch + 1)
+
+            # --- END MODIFICATION FOR PROPOSED METHOD LOGGING ---
+            
             if self.args.ent_min:
                 self.writer.add_scalar('Loss/Uncertainty', train_results['loss_uncertainty'], epoch + 1)
             if self.args.cls_prior:
