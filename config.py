@@ -1,6 +1,7 @@
+# %%writefile /kaggle/working/-SLCL-Boundary/config.py
 import numpy as np
 
-MODEL = 'resnet50'
+MODEL = 'dr_unet'
 BATCH_SIZE = 16
 EVAL_BS = 32
 NUM_WORKERS = 8
@@ -22,7 +23,7 @@ RANDOM_SEED = 1234
 INPUT_SIZE = 224
 DATA_DIRECTORY = "/kaggle/input/ct-mr-2d-dataset-da/CT_MR_2D_Dataset_mmwhs"
 RAW_DATA_DIRECTORY = "/kaggle/input/ct-mr-2d-dataset-da/CT_MR_2D_Dataset_mmwhs"
-EPOCHS = 200
+EPOCHS = 2
 WARMUP_EPOCHS = EPOCHS
 EPS_ITERS = 5
 
@@ -35,7 +36,11 @@ WEIGHT_MSE =0.002
 WEIGHT_CONSIST = 2e-3
 WEIGHT_EPS_CTS = .001
 WEIGHT_THD = 0.
+AUG_WEAK_MODE = 'simple' # e.g., 'simple', 'none' (for identity)
+AUG_STRONG_MODE = 'heavy' # e.g., 'heavy', 'heavy2'
 
+# Temperature for sharpening pseudo-labels (if used)
+SHARPENING_TEMPERATURE = 0.5 
 """split 0"""
 MMWHS_TEST_FOLD1 = [1, 4, 6, 7, 8, 9, 10, 11, 16, 17]
 MMWHS_TEST_FOLD2 = [2, 3, 5, 12, 13, 14, 15, 18, 19, 20]
